@@ -1,5 +1,4 @@
 Created for OpenSpace 0.21
-Modified for OpenSpace 0.22
 
 Modified from https://github.com/hn-88/openspace-scripts/tree/main/OpenSpace-ConstellationsTonight_draft
 
