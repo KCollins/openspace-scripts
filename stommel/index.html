@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>OpenSpace Spatiotemporal Log-Log Navigator</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background-color: #0b0e14;
+      color: #e0e6ed;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      overflow: hidden;
+    }
+    header {
+      padding: 12px 20px;
+      background: #161b22;
+      border-bottom: 1px solid #30363d;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    h1 { font-size: 1.1rem; font-weight: 600; color: #58a6ff; }
+    #status-badge {
+      font-size: 0.85rem;
+      padding: 4px 10px;
+      border-radius: 12px;
+      background: #3d1a1a;
+      color: #ff7b72;
+    }
+    #status-badge.connected {
+      background: #123d1c;
+      color: #56d364;
+    }
+    #container {
+      flex: 1;
+      position: relative;
+      width: 100%;
+      height: 100%;
+    }
+    canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+      cursor: crosshair;
+    }
+    #tooltip {
+      position: absolute;
+      pointer-events: none;
+      background: rgba(22, 27, 34, 0.95);
+      border: 1px solid #30363d;
+      padding: 8px 12px;
+      border-radius: 6px;
+      font-size: 0.85rem;
+      display: none;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+    }
+  </style>
+</head>
+<body>
+
+  <header>
+    <h1>OpenSpace Stommel Diagram Navigator</h1>
+    <div id="status-badge">Disconnected (ws://localhost:4690)</div>
+  </header>
+
+  <div id="container">
+    <canvas id="chart"></canvas>
+    <div id="tooltip"></div>
+  </div>
+
+  <script>
+    // --- WebSocket Connection setup ---
+    const WS_URL = "ws://localhost:4690";
+    let socket = null;
+    let isConnected = false;
+
+    function connectWebSocket() {
+      socket = new WebSocket(WS_URL);
+
+      socket.onopen = () => {
+        isConnected = true;
+        const badge = document.getElementById('status-badge');
+        badge.textContent = 'Connected to OpenSpace';
+        badge.classList.add('connected');
+        console.log("Connected to OpenSpace WebSocket server");
+      };
+
+      socket.onclose = () => {
+        isConnected = false;
+        const badge = document.getElementById('status-badge');
+        badge.textContent = 'Disconnected (Retrying...)';
+        badge.classList.remove('connected');
+        setTimeout(connectWebSocket, 3000);
+      };
+
+      socket.onerror = (err) => {
+        console.error("WebSocket error:", err);
+      };
+    }
+
+    function sendLuaScript(script) {
+      if (!isConnected || !socket) return;
+      
+      // Standard OpenSpace WebSocket payload structure
+      const message = {
+        topic: 4,
+        type: "luascript",
+        payload: {
+          function: "openspace.scripting.runScript",
+          arguments: [script]
+        }
+      };
+      socket.send(JSON.stringify(message));
+    }
+
+    // --- Chart Range Definitions (Log10 scale) ---
+    // Horizontal: Spatial Scale in meters (10^1 = 10m to 10^8 = 100,000 km)
+    const minLogX = 1, maxLogX = 8;
+    // Vertical: Time Scale in seconds (10^0 = 1 sec to 10^8 = ~3 years)
+    const minLogY = 0, maxLogY = 8;
+
+    // --- Phenomena / Landmark Data ---
+    const landmarks = [
+      { name: "Thunderstorm", minX: 3.5, maxX: 4.5, minY: 2.5, maxY: 3.8, color: "#f1e05a" },
+      { name: "Hurricane", minX: 5.2, maxX: 6.0, minY: 4.2, maxY: 5.5, color: "#ff7b72" },
+      { name: "Ocean Eddy", minX: 4.0, maxX: 5.3, minY: 5.0, maxY: 6.5, color: "#79c0ff" },
+      { name: "Tsunami", minX: 5.0, maxX: 6.5, minY: 2.8, maxY: 3.6, color: "#d2a8ff" },
+      { name: "Tides", minX: 6.5, maxX: 7.3, minY: 4.0, maxY: 4.8, color: "#ffa657" },
+      { name: "Thermohaline Circulation", minX: 6.8, maxX: 7.5, minY: 7.0, maxY: 8.0, color: "#56d364" }
+    ];
+
+    // Current simulation indicator target
+    let activeState = { logX: 5.7, logY: 4.3 }; 
+
+    // --- Canvas Setup ---
+    const canvas = document.getElementById('chart');
+    const ctx = canvas.getContext('2d');
+    const tooltip = document.getElementById('tooltip');
+    
+    const padding = { top: 40, right: 40, bottom: 60, left: 80 };
+
+    function resizeCanvas() {
+      canvas.width = canvas.parentElement.clientWidth;
+      canvas.height = canvas.parentElement.clientHeight;
+      drawChart();
+    }
+    window.addEventListener('resize', resizeCanvas);
+
+    // --- Math Mapping Helpers ---
+    function logXToPixel(logX) {
+      const plotWidth = canvas.width - padding.left - padding.right;
+      return padding.left + ((logX - minLogX) / (maxLogX - minLogX)) * plotWidth;
+    }
+
+    function logYToPixel(logY) {
+      const plotHeight = canvas.height - padding.top - padding.bottom;
+      return canvas.height - padding.bottom - ((logY - minLogY) / (maxLogY - minLogY)) * plotHeight;
+    }
+
+    function pixelToLogX(px) {
+      const plotWidth = canvas.width - padding.left - padding.right;
+      return minLogX + ((px - padding.left) / plotWidth) * (maxLogX - minLogX);
+    }
+
+    function pixelToLogY(py) {
+      const plotHeight = canvas.height - padding.top - padding.bottom;
+      return minLogY + ((canvas.height - padding.bottom - py) / plotHeight) * (maxLogY - minLogY);
+    }
+
+    function formatDistance(meters) {
+      if (meters >= 1e6) return (meters / 1e6).toFixed(0) + "k km";
+      if (meters >= 1e3) return (meters / 1e3).toFixed(0) + " km";
+      return meters.toFixed(0) + " m";
+    }
+
+    function formatTime(seconds) {
+      if (seconds >= 31536000) return (seconds / 31536000).toFixed(1) + " yrs/s";
+      if (seconds >= 86400) return (seconds / 86400).toFixed(1) + " days/s";
+      if (seconds >= 3600) return (seconds / 3600).toFixed(1) + " hrs/s";
+      if (seconds >= 60) return (seconds / 60).toFixed(1) + " mins/s";
+      return seconds.toFixed(0) + " s/s";
+    }
+
+    // --- Main Render Function ---
+    function drawChart() {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      const plotWidth = canvas.width - padding.left - padding.right;
+      const plotHeight = canvas.height - padding.top - padding.bottom;
+
+      // Draw Grid Lines & Axis Ticks
+      ctx.strokeStyle = '#21262d';
+      ctx.fillStyle = '#8b949e';
+      ctx.font = '12px sans-serif';
+
+      // X-Axis (Spatial Scale)
+      for (let x = minLogX; x <= maxLogX; x++) {
+        const px = logXToPixel(x);
+        ctx.beginPath();
+        ctx.moveTo(px, padding.top);
+        ctx.lineTo(px, canvas.height - padding.bottom);
+        ctx.stroke();
+
+        const label = formatDistance(Math.pow(10, x));
+        ctx.fillText(label, px - 15, canvas.height - padding.bottom + 20);
+      }
+
+      // Y-Axis (Time Scale)
+      for (let y = minLogY; y <= maxLogY; y++) {
+        const py = logYToPixel(y);
+        ctx.beginPath();
+        ctx.moveTo(padding.left, py);
+        ctx.lineTo(canvas.width - padding.right, py);
+        ctx.stroke();
+
+        const label = formatTime(Math.pow(10, y));
+        ctx.fillText(label, padding.left - 65, py + 4);
+      }
+
+      // Draw Axis Titles
+      ctx.fillStyle = '#c9d1d9';
+      ctx.font = '14px sans-serif';
+      ctx.fillText("Spatial Scale (Visual Altitude / FoV)", canvas.width / 2 - 80, canvas.height - 15);
+
+      ctx.save();
+      ctx.translate(20, canvas.height / 2 + 50);
+      ctx.rotate(-Math.PI / 2);
+      ctx.fillText("Temporal Scale (Delta Time Rate)", 0, 0);
+      ctx.restore();
+
+      // Draw Landmarks (Bounding Regions)
+      landmarks.forEach(lm => {
+        const x1 = logXToPixel(lm.minX);
+        const x2 = logXToPixel(lm.maxX);
+        const y1 = logYToPixel(lm.maxY); // Y pixel inverted
+        const y2 = logYToPixel(lm.minY);
+
+        ctx.fillStyle = lm.color + "22"; // 13% opacity
+        ctx.strokeStyle = lm.color;
+        ctx.lineWidth = 1.5;
+
+        ctx.fillRect(x1, y1, x2 - x1, y2 - y1);
+        ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+
+        ctx.fillStyle = lm.color;
+        ctx.font = '12px sans-serif';
+        ctx.fillText(lm.name, x1 + 6, y1 + 18);
+      });
+
+      // Draw Current Active State Marker
+      const activePx = logXToPixel(activeState.logX);
+      const activePy = logYToPixel(activeState.logY);
+
+      ctx.strokeStyle = '#ffffff';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(activePx, activePy, 8, 0, Math.PI * 2);
+      ctx.stroke();
+
+      ctx.fillStyle = '#58a6ff';
+      ctx.beginPath();
+      ctx.arc(activePx, activePy, 4, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // --- Interaction Handlers ---
+    canvas.addEventListener('mousemove', (e) => {
+      const rect = canvas.getBoundingClientRect();
+      const x = e.clientX - rect.left;
+      const y = e.clientY - rect.top;
+
+      if (x >= padding.left && x <= canvas.width - padding.right &&
+          y >= padding.top && y <= canvas.height - padding.bottom) {
+        
+        const logX = pixelToLogX(x);
+        const logY = pixelToLogY(y);
+
+        const spaceVal = Math.pow(10, logX);
+        const timeVal = Math.pow(10, logY);
+
+        // Check if hovering over landmark
+        const hoveredLm = landmarks.find(lm => 
+          logX >= lm.minX && logX <= lm.maxX && logY >= lm.minY && logY <= lm.maxY
+        );
+
+        tooltip.style.display = 'block';
+        tooltip.style.left = (e.clientX + 15) + 'px';
+        tooltip.style.top = (e.clientY + 15) + 'px';
+        
+        let html = `<strong>Spatial:</strong> ${formatDistance(spaceVal)}<br/>` +
+                   `<strong>Time Rate:</strong> ${formatTime(timeVal)}`;
+        if (hoveredLm) {
+          html = `<strong>${hoveredLm.name}</strong><br/>` + html;
+        }
+        tooltip.innerHTML = html;
+      } else {
+        tooltip.style.display = 'none';
+      }
+    });
+
+    canvas.addEventListener('click', (e) => {
+      const rect = canvas.getBoundingClientRect();
+      const x = e.clientX - rect.left;
+      const y = e.clientY - rect.top;
+
+      if (x >= padding.left && x <= canvas.width - padding.right &&
+          y >= padding.top && y <= canvas.height - padding.bottom) {
+
+        const logX = pixelToLogX(x);
+        const logY = pixelToLogY(y);
+
+        activeState = { logX, logY };
+        drawChart();
+
+        const targetAltitudeMeters = Math.pow(10, logX);
+        const targetDeltaTimeSeconds = Math.pow(10, logY);
+
+        // Construct Lua script execution payload
+        const luaScript = `
+          openspace.time.setDeltaTime(${targetDeltaTimeSeconds});
+          openspace.navigation.flyToHeight('Earth', ${targetAltitudeMeters});
+        `;
+
+        console.log("Executing on OpenSpace:", luaScript);
+        sendLuaScript(luaScript);
+      }
+    });
+
+    // Start WebSocket & Initial Render
+    connectWebSocket();
+    resizeCanvas();
+  </script>
+</body>
+</html>
