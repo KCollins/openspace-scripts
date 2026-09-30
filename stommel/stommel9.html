@@ -109,7 +109,7 @@
     let userClickTimer = null;
     let isUserInteracting = false;
 
-    // Dynamically updated from OpenSpace (defaults to Earth's bounding sphere radius)
+    // Earth bounding sphere radius in meters (calibrated dynamically by reverse sync)
     let earthFocusRadius = 6376401.7;
 
     function updateStatus(connected, message) {
@@ -150,17 +150,15 @@
             let surfaceAltitude = null;
             let totalDistance = null;
 
-            // 1. Read altitude above surface directly
             if (openspace.navigation.distanceToFocusBoundingSphere) {
               surfaceAltitude = await openspace.navigation.distanceToFocusBoundingSphere();
             }
 
-            // 2. Read total distance to focus center
             if (openspace.navigation.distanceToFocus) {
               totalDistance = await openspace.navigation.distanceToFocus();
             }
 
-            // Dynamically calculate focus node bounding radius (D_center - D_surface)
+            // Calibrate Earth focus radius dynamically: R_earth = D_center - D_surface
             if (typeof totalDistance === 'number' && typeof surfaceAltitude === 'number') {
               earthFocusRadius = totalDistance - surfaceAltitude;
             } else if (typeof totalDistance === 'number' && surfaceAltitude === null) {
@@ -170,12 +168,11 @@
             const deltaTime = await openspace.time.deltaTime();
 
             if (typeof surfaceAltitude === 'number' && typeof deltaTime === 'number') {
-              // Clamp altitude to positive minimum for log scale calculation
               const safeAltitude = Math.max(10, surfaceAltitude);
               updateChartStateFromOpenSpace(safeAltitude, Math.abs(deltaTime));
             }
           } catch (e) {
-            // Gracefully handle timing gaps during camera shifts
+            // Ignore minor timing gap during camera transition
           }
         }
       }, 150);
@@ -272,18 +269,16 @@
         setSyncStatus(true, "Sync: Live");
       }, 2500);
 
+      // Total distance along current view line = surface altitude + center radius
       const targetTotalDistance = earthFocusRadius + altitudeMeters;
 
-      console.log(`Target Altitude: ${altitudeMeters.toFixed(0)}m (Total Distance: ${targetTotalDistance.toFixed(0)}m), DeltaTime: ${deltaTimeSeconds.toFixed(1)}s/s`);
+      console.log(`Zooming along sightline -> Altitude: ${altitudeMeters.toFixed(0)}m (Total Distance: ${targetTotalDistance.toFixed(0)}m), DeltaTime: ${deltaTimeSeconds.toFixed(1)}s/s`);
 
-      // 1. Send via official API wrapper (prefer flyToHeight for direct altitude control)
+      // 1. Primary path: zoomToDistance preserves view orientation/geographic focus
       if (openspace) {
         try {
           await openspace.time.setDeltaTime(deltaTimeSeconds);
-          
-          if (openspace.navigation && openspace.navigation.flyToHeight) {
-            await openspace.navigation.flyToHeight('Earth', altitudeMeters);
-          } else if (openspace.navigation && openspace.navigation.zoomToDistance) {
+          if (openspace.navigation && openspace.navigation.zoomToDistance) {
             await openspace.navigation.zoomToDistance(targetTotalDistance);
           }
           return;
@@ -292,9 +287,9 @@
         }
       }
 
-      // 2. Direct JSON-RPC over WebSocket fallback
+      // 2. Native WebSocket fallback using zoomToDistance
       if (nativeSocket && nativeSocket.readyState === WebSocket.OPEN) {
-        const luaScript = `openspace.time.setDeltaTime(${deltaTimeSeconds}); if openspace.navigation.flyToHeight then openspace.navigation.flyToHeight('Earth', ${altitudeMeters}) else openspace.navigation.zoomToDistance(${targetTotalDistance}) end`;
+        const luaScript = `openspace.time.setDeltaTime(${deltaTimeSeconds}); openspace.navigation.zoomToDistance(${targetTotalDistance});`;
         const payload = {
           topic: 0,
           type: "luascript",
