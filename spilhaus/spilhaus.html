@@ -1,0 +1,428 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>OpenSpace Spilhaus Projection WebPanel</title>
+  
+  <!-- OpenSpace JS API -->
+  <script src="https://unpkg.com/openspace-api-js@latest/dist/openspace-api.js" 
+          onerror="console.warn('CDN offline or blocked. Falling back to native WebSocket driver.');"></script>
+  
+  <!-- D3.js & D3 Geo Projection for Spilhaus Mapping -->
+  <script src="https://d3js.org/d3.v7.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/d3-geo-projection@4"></script>
+  <script src="https://cdn.jsdelivr.net/npm/topojson-client@3"></script>
+
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background-color: #0b0e14;
+      color: #e0e6ed;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      overflow: hidden;
+    }
+    header {
+      padding: 12px 20px;
+      background: #161b22;
+      border-bottom: 1px solid #30363d;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    h1 { font-size: 1.1rem; font-weight: 600; color: #58a6ff; }
+    .status-container {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    #sync-badge {
+      font-size: 0.75rem;
+      padding: 3px 8px;
+      border-radius: 10px;
+      background: #21262d;
+      color: #8b949e;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      border: 1px solid #30363d;
+    }
+    #sync-badge.active {
+      color: #58a6ff;
+      border-color: #1f6feb;
+    }
+    .pulse-dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: #8b949e;
+    }
+    #sync-badge.active .pulse-dot {
+      background: #58a6ff;
+      box-shadow: 0 0 6px #58a6ff;
+    }
+    #status-badge {
+      font-size: 0.85rem;
+      padding: 4px 10px;
+      border-radius: 12px;
+      background: #3d1a1a;
+      color: #ff7b72;
+      transition: all 0.3s ease;
+    }
+    #status-badge.connected {
+      background: #123d1c;
+      color: #56d364;
+    }
+    #container { flex: 1; position: relative; width: 100%; height: 100%; }
+    canvas { display: block; width: 100%; height: 100%; cursor: crosshair; }
+    #tooltip {
+      position: absolute; pointer-events: none;
+      background: rgba(22, 27, 34, 0.95); border: 1px solid #30363d;
+      padding: 8px 12px; border-radius: 6px; font-size: 0.85rem;
+      display: none; box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+      z-index: 10;
+    }
+  </style>
+</head>
+<body>
+
+  <header>
+    <h1>OpenSpace Spilhaus World Ocean Navigator</h1>
+    <div class="status-container">
+      <div id="sync-badge">
+        <span class="pulse-dot"></span>
+        <span id="sync-text">Sync: Idle</span>
+      </div>
+      <div id="status-badge">Connecting to OpenSpace (Port 4682)...</div>
+    </div>
+  </header>
+
+  <div id="container">
+    <canvas id="map"></canvas>
+    <div id="tooltip"></div>
+  </div>
+
+  <script>
+    // --- Engine & Sync State ---
+    let openspace = null;
+    let nativeSocket = null;
+    let isConnected = false;
+
+    let syncInterval = null;
+    let userClickTimer = null;
+    let isUserInteracting = false;
+
+    // Camera Geo State
+    let activeGeoState = { lat: 0, lon: 0, altitude: 10000000 };
+
+    // D3 Spilhaus Projection Setup
+    const canvas = document.getElementById('map');
+    const ctx = canvas.getContext('2d');
+    const tooltip = document.getElementById('tooltip');
+
+    let projection = null;
+    let pathGenerator = null;
+    let worldData = null;
+
+    // Target altitude: 10,000 km in meters
+    const TARGET_ALTITUDE_METERS = 10000000;
+
+    function initProjection() {
+      const width = canvas.clientWidth;
+      const height = canvas.clientHeight;
+
+      // Initialize Spilhaus Projection
+      projection = d3.geoSpilhaus()
+        .fitExtent([[20, 20], [width - 20, height - 20]], { type: "Sphere" });
+
+      pathGenerator = d3.geoPath(projection, ctx);
+    }
+
+    // Load World TopoJSON for coastline map overlay
+    async function loadMapData() {
+      try {
+        const res = await fetch("https://cdn.jsdelivr.net/npm/world-atlas@2/land-110m.json");
+        const topo = await res.json();
+        worldData = topojson.feature(topo, topo.objects.land);
+        drawMap();
+      } catch (err) {
+        console.warn("Could not load land vectors, falling back to basic grid", err);
+        drawMap();
+      }
+    }
+
+    function drawMap() {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      if (!projection) return;
+
+      // 1. Draw Ocean Background / Sphere Boundary
+      ctx.beginPath();
+      pathGenerator({ type: "Sphere" });
+      ctx.fillStyle = "#0d1b2a";
+      ctx.fill();
+      ctx.strokeStyle = "#30363d";
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+
+      // 2. Draw Graticules (Latitude / Longitude Grid)
+      const graticule = d3.geoGraticule10();
+      ctx.beginPath();
+      pathGenerator(graticule);
+      ctx.strokeStyle = "rgba(88, 166, 255, 0.15)";
+      ctx.lineWidth = 0.8;
+      ctx.stroke();
+
+      // 3. Draw Land Masses
+      if (worldData) {
+        ctx.beginPath();
+        pathGenerator(worldData);
+        ctx.fillStyle = "#1b2838";
+        ctx.fill();
+        ctx.strokeStyle = "#415a77";
+        ctx.lineWidth = 1;
+        ctx.stroke();
+      }
+
+      // 4. Draw Camera Reticle
+      if (activeGeoState) {
+        const coords = projection([activeGeoState.lon, activeGeoState.lat]);
+        if (coords && !isNaN(coords[0]) && !isNaN(coords[1])) {
+          const [px, py] = coords;
+
+          // Target Pulsing Outer Circle
+          ctx.strokeStyle = isUserInteracting ? '#e3b341' : '#58a6ff';
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          ctx.arc(px, py, 10, 0, Math.PI * 2);
+          ctx.stroke();
+
+          // Crosshairs
+          ctx.strokeStyle = isUserInteracting ? '#f2c744' : '#79c0ff';
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          ctx.moveTo(px - 14, py); ctx.lineTo(px + 14, py);
+          ctx.moveTo(px, py - 14); ctx.lineTo(px, py + 14);
+          ctx.stroke();
+
+          // Center Dot
+          ctx.fillStyle = isUserInteracting ? '#f2c744' : '#58a6ff';
+          ctx.beginPath();
+          ctx.arc(px, py, 3.5, 0, Math.PI * 2);
+          ctx.fill();
+        }
+      }
+    }
+
+    function updateStatus(connected, message) {
+      isConnected = connected;
+      const badge = document.getElementById('status-badge');
+      badge.textContent = message;
+      if (connected) {
+        badge.classList.add('connected');
+        startReverseSync();
+      } else {
+        badge.classList.remove('connected');
+        stopReverseSync();
+      }
+    }
+
+    function setSyncStatus(active, text) {
+      const syncBadge = document.getElementById('sync-badge');
+      const syncText = document.getElementById('sync-text');
+      syncText.textContent = text;
+      if (active) {
+        syncBadge.classList.add('active');
+      } else {
+        syncBadge.classList.remove('active');
+      }
+    }
+
+    // --- Reverse Sync Loop ---
+    function startReverseSync() {
+      if (syncInterval) clearInterval(syncInterval);
+      setSyncStatus(true, "Sync: Live");
+
+      syncInterval = setInterval(async () => {
+        if (!isConnected || isUserInteracting) return;
+
+        if (openspace) {
+          try {
+            // Retrieve current camera navigation state or position
+            let navState = null;
+            if (openspace.navigation && openspace.navigation.getNavigationState) {
+              navState = await openspace.navigation.getNavigationState();
+            }
+
+            if (navState && navState.Position && navState.Anchor === "Earth") {
+              // Convert position state if available or fallback to local position
+              updateStateFromOpenSpace(navState.Latitude || 0, navState.Longitude || 0);
+            }
+          } catch (e) {
+            // Ignore temporary frame transition gaps
+          }
+        }
+      }, 200);
+    }
+
+    function stopReverseSync() {
+      if (syncInterval) {
+        clearInterval(syncInterval);
+        syncInterval = null;
+      }
+      setSyncStatus(false, "Sync: Offline");
+    }
+
+    function updateStateFromOpenSpace(lat, lon) {
+      if (Math.abs(activeGeoState.lat - lat) > 0.05 || Math.abs(activeGeoState.lon - lon) > 0.05) {
+        activeGeoState.lat = lat;
+        activeGeoState.lon = lon;
+        drawMap();
+      }
+    }
+
+    // --- OpenSpace Communication ---
+    function initOpenSpaceConnection() {
+      if (typeof window.openspaceApi === 'function') {
+        try {
+          const api = window.openspaceApi('localhost', 4682);
+
+          api.onConnect(async () => {
+            try {
+              openspace = await api.library();
+              updateStatus(true, 'Connected to OpenSpace (Port 4682 - API)');
+            } catch (err) {
+              initNativeWebSocket();
+            }
+          });
+
+          api.onDisconnect(() => updateStatus(false, 'Disconnected from OpenSpace'));
+          api.connect();
+          return;
+        } catch (e) {
+          console.warn("API lib failed, dropping to WebSocket:", e);
+        }
+      }
+      initNativeWebSocket();
+    }
+
+    function initNativeWebSocket() {
+      try {
+        nativeSocket = new WebSocket('ws://localhost:4682/');
+
+        nativeSocket.onopen = () => updateStatus(true, 'Connected to OpenSpace (Port 4682 - Native WS)');
+        nativeSocket.onclose = () => {
+          updateStatus(false, 'Disconnected (Retrying in 3s...)');
+          setTimeout(initNativeWebSocket, 3000);
+        };
+        nativeSocket.onerror = () => updateStatus(false, 'Connection Error (Port 4682)');
+      } catch (err) {
+        console.error("WebSocket setup error:", err);
+      }
+    }
+
+    async function executeGoToGeoCommand(lat, lon, altitudeMeters) {
+      if (!isConnected) {
+        console.warn("Cannot send command: OpenSpace disconnected.");
+        return;
+      }
+
+      isUserInteracting = true;
+      setSyncStatus(true, "Sync: Command Active");
+
+      if (userClickTimer) clearTimeout(userClickTimer);
+      userClickTimer = setTimeout(() => {
+        isUserInteracting = false;
+        setSyncStatus(true, "Sync: Live");
+      }, 3000);
+
+      console.log(`Navigating to Lat: ${lat.toFixed(2)}°, Lon: ${lon.toFixed(2)}°, Alt: ${(altitudeMeters/1000).toFixed(0)} km`);
+
+      // Script command for OpenSpace v0.22 globebrowsing module
+      const luaScript = `openspace.globebrowsing.goToGeo("Earth", ${lat.toFixed(4)}, ${lon.toFixed(4)}, ${altitudeMeters});`;
+
+      if (openspace) {
+        try {
+          if (openspace.globebrowsing && openspace.globebrowsing.goToGeo) {
+            await openspace.globebrowsing.goToGeo("Earth", lat, lon, altitudeMeters);
+            return;
+          }
+        } catch (err) {
+          console.warn("API direct call failed, sending via script payload fallback", err);
+        }
+      }
+
+      // Fallback via WebSocket JSON payload
+      if (nativeSocket && nativeSocket.readyState === WebSocket.OPEN) {
+        const payload = {
+          topic: 0,
+          type: "luascript",
+          payload: { script: luaScript }
+        };
+        nativeSocket.send(JSON.stringify(payload));
+      }
+    }
+
+    // --- Mouse & Event Listeners ---
+    function resizeCanvas() {
+      canvas.width = canvas.parentElement.clientWidth;
+      canvas.height = canvas.parentElement.clientHeight;
+      initProjection();
+      drawMap();
+    }
+    window.addEventListener('resize', resizeCanvas);
+
+    canvas.addEventListener('mousemove', (e) => {
+      const rect = canvas.getBoundingClientRect();
+      const px = e.clientX - rect.left;
+      const py = e.clientY - rect.top;
+
+      const coords = projection.invert([px, py]);
+
+      if (coords && !isNaN(coords[0]) && !isNaN(coords[1])) {
+        const [lon, lat] = coords;
+        tooltip.style.display = 'block';
+        tooltip.style.left = (e.clientX + 15) + 'px';
+        tooltip.style.top = (e.clientY + 15) + 'px';
+        tooltip.innerHTML = `<strong>Latitude:</strong> ${lat.toFixed(2)}°<br/>` +
+                            `<strong>Longitude:</strong> ${lon.toFixed(2)}°<br/>` +
+                            `<em>Click to move camera (10,000 km)</em>`;
+      } else {
+        tooltip.style.display = 'none';
+      }
+    });
+
+    canvas.addEventListener('mouseleave', () => {
+      tooltip.style.display = 'none';
+    });
+
+    canvas.addEventListener('click', (e) => {
+      const rect = canvas.getBoundingClientRect();
+      const px = e.clientX - rect.left;
+      const py = e.clientY - rect.top;
+
+      const coords = projection.invert([px, py]);
+
+      if (coords && !isNaN(coords[0]) && !isNaN(coords[1])) {
+        const [lon, lat] = coords;
+
+        activeGeoState.lat = lat;
+        activeGeoState.lon = lon;
+        drawMap();
+
+        executeGoToGeoCommand(lat, lon, TARGET_ALTITUDE_METERS);
+      }
+    });
+
+    // --- Startup ---
+    window.addEventListener('DOMContentLoaded', () => {
+      resizeCanvas();
+      loadMapData();
+      initOpenSpaceConnection();
+    });
+  </script>
+</body>
+</html>
